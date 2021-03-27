@@ -1,0 +1,313 @@
+This patch allows you to snoop on the Windows driver running under qemu,
+using vfio to pass through the modem.
+
+diff -ur qemu-4.0.0/hw/vfio/common.c /home/jhl/proj/fibo/patched_qemu/work/qemu-4.0.0/hw/vfio/common.c
+--- qemu-4.0.0/hw/vfio/common.c	2019-04-24 04:14:46.000000000 +1000
++++ /home/jhl/proj/fibo/patched_qemu/work/qemu-4.0.0/hw/vfio/common.c	2019-10-06 07:45:10.006015989 +1100
+@@ -37,6 +37,162 @@
+ #include "trace.h"
+ #include "qapi/error.h"
+ 
++uint64_t ctl_ptrs[6];
++
++uint32_t status[3];
++
++uint32_t list1[16];
++uint32_t list2[16];
++
++uint32_t ringp1, ringp2;
++
++struct {
++	uint64_t p1, p2, p3;
++} ring[128];
++
++uint64_t xmm_base = 0;
++
++static void xmm_dump(void) {
++	error_printf("xmm: %08x %08x %08x rp: %02x %02x\n", status[0], status[1], status[2], ringp1, ringp2);
++	error_printf("xmm list1: ");
++	for (int i=0; i<16; i++)
++		error_printf(" %02x", list1[i]);
++	error_printf("\n");
++	error_printf("xmm list2: ");
++	for (int i=0; i<16; i++)
++		error_printf(" %02x", list2[i]);
++	error_printf("\n");
++
++	for (int i=0; i<8; i++)
++		error_printf("xmm ring%d: ix%" PRIx64 " ix%" PRIx64 " ix%" PRIx64 "  ", i, ring[i].p1, ring[i].p2, ring[i].p3);
++	error_printf("\n");
++}
++
++static void x_xmm_update(void) {
++	if (xmm_base)
++		cpu_physical_memory_read(xmm_base, ctl_ptrs, 6*sizeof(uint32_t));
++	else
++		return;
++        //error_printf("xmm ptrs: %" PRIx64 " %" PRIx64 " %" PRIx64 "\n", ctl_ptrs[0], ctl_ptrs[1], ctl_ptrs[2]);
++	if (ctl_ptrs[0])
++		cpu_physical_memory_read(ctl_ptrs[0], status, sizeof(status));
++	if (ctl_ptrs[1])
++		cpu_physical_memory_read(ctl_ptrs[1], list1, sizeof(list1));
++	if (ctl_ptrs[2])
++		cpu_physical_memory_read(ctl_ptrs[2], list2, sizeof(list2));
++	if (ctl_ptrs[3])
++		cpu_physical_memory_read(ctl_ptrs[3], &ringp1, sizeof(ringp1));
++	if (ctl_ptrs[4])
++		cpu_physical_memory_read(ctl_ptrs[4], &ringp2, sizeof(ringp2));
++	if (ctl_ptrs[5])
++		cpu_physical_memory_read(ctl_ptrs[5], ring, sizeof(ring));
++
++	xmm_dump();
++}
++
++uint8_t buf[0xcd0];
++uint8_t last_ring_done = 0;
++
++struct sub_ring_ {
++	uint64_t ptr;
++	uint32_t a, b, c, d;
++	int size, active, last_seen;
++} sub_rings[16];
++
++typedef struct {
++	uint64_t ptr;
++	uint32_t a, b;
++} sub_ring_entry;
++
++static void scan_sub_ring(int ring, uint32_t *ringp1, uint32_t *ringp2) {
++	struct sub_ring_ *r = &sub_rings[ring];
++	if (!r->active)
++		return;
++	int wptr = ringp1[ring];
++	int rptr = ringp2[ring];
++
++	while (r->last_seen != wptr) {
++		sub_ring_entry sre;
++		cpu_physical_memory_read(r->ptr + 16*r->last_seen, &sre, sizeof(sre));
++
++		printf("r%d ls %d sre: %lx %x %x; ", ring, r->last_seen, sre.ptr, sre.a, sre.b);
++		if (sre.ptr) {
++			uint8_t buf[32];
++			cpu_physical_memory_read(sre.ptr, buf, sizeof(buf));
++			for (int i=0; i<sizeof(buf); i++)
++			  printf(" %02X", buf[i]);
++		}
++		printf("\n");
++
++		r->last_seen = (r->last_seen + 1) % r->size;
++
++	}
++}
++
++
++static void xmm_update(void) {
++    if (!xmm_base)
++    	return;
++
++    cpu_physical_memory_read(xmm_base, buf, sizeof(buf));
++
++    uint32_t *stat = &buf[0x38];
++    int wptr = buf[0x44];
++    int rptr = buf[0x88];
++    printf("xmm stat: %08x rp: %02x %02x\n", *stat, wptr, rptr);
++
++    uint32_t *ringp1 = &buf[0x48];
++    uint32_t *ringp2 = &buf[0x8c];
++
++    printf("ringp1: ");
++    for (int i=0; i<16; i++)
++    	printf(" %x", ringp1[i]);
++    printf("\n");
++    printf("ringp2: ");
++    for (int i=0; i<16; i++)
++    	printf(" %x", ringp2[i]);
++    printf("\n");
++
++    while (wptr != last_ring_done) {
++    	struct __attribute__((packed)) {
++		uint64_t ptr;
++		uint32_t a, b, c, d;
++	} *entry = &buf[0xd0 + 24*last_ring_done];
++
++	int cmd = entry->a >> 24;
++	int parm = entry->a & 0xffffff;
++    	printf("ring %d c=%x p=%x ptr=%lx %x %x %x", last_ring_done, cmd, parm, entry->ptr, entry->b, entry->c, entry->d);
++
++	int which = parm >> 16;
++	if (cmd == 1) {
++		printf(" (storing)");
++		sub_rings[which].ptr = entry->ptr;
++		sub_rings[which].a = entry->a;
++		sub_rings[which].b = entry->b;
++		sub_rings[which].c = entry->c;
++		sub_rings[which].d = entry->d;
++		sub_rings[which].size = parm & 0xff;
++		sub_rings[which].last_seen = 0;
++		sub_rings[which].active = 1;
++	}
++	if (cmd == 3) {
++		sub_rings[which].active = 0;
++	}
++	printf("\n");
++
++	last_ring_done += 1;
++	last_ring_done &= 0x7f;
++    }
++
++    for (int i=0; i<16; i++)
++        scan_sub_ring(i, ringp1, ringp2);
++
++
++    //x_xmm_update();
++}
++
++
++
+ VFIOGroupList vfio_group_list =
+     QLIST_HEAD_INITIALIZER(vfio_group_list);
+ static QLIST_HEAD(, VFIOAddressSpace) vfio_address_spaces =
+@@ -135,6 +291,13 @@
+                      addr, data, size);
+     }
+ 
++    if (region->nr == 2 && addr == 0x64)
++    	xmm_base = (xmm_base & 0xffffffff00000000) | data;
++    if (region->nr == 2 && addr == 0x68)
++        xmm_base = (xmm_base & 0xffffffff) | (data << 32);
++    //error_printf("xmm_base: 0x%" PRIx64 "\n", xmm_base);
++    xmm_update();
++
+     trace_vfio_region_write(vbasedev->name, region->nr, addr, data, size);
+ 
+     /*
+@@ -1449,6 +1612,8 @@
+     struct vfio_device_info dev_info = { .argsz = sizeof(dev_info) };
+     int ret, fd;
+ 
++    error_printf("in vfio_get_device\n");
++
+     fd = ioctl(group->fd, VFIO_GROUP_GET_DEVICE_FD, name);
+     if (fd < 0) {
+         error_setg_errno(errp, errno, "error getting device from group %d",
+@@ -1458,6 +1623,7 @@
+                       "or pci-stub and not already in use\n", group->groupid);
+         return fd;
+     }
++    error_printf("got device fd: %d\n", fd);
+ 
+     ret = ioctl(fd, VFIO_DEVICE_GET_INFO, &dev_info);
+     if (ret) {
+@@ -1465,6 +1631,7 @@
+         close(fd);
+         return ret;
+     }
++    error_printf("got device info\n");
+ 
+     /*
+      * Clear the balloon inhibitor for this group if the driver knows the
+@@ -1498,6 +1665,7 @@
+                           dev_info.num_irqs);
+ 
+     vbasedev->reset_works = !!(dev_info.flags & VFIO_DEVICE_FLAGS_RESET);
++    error_printf("reset works: %d\n", vbasedev->reset_works);
+     return 0;
+ }
+ 
+diff -ur qemu-4.0.0/hw/vfio/pci.c /home/jhl/proj/fibo/patched_qemu/work/qemu-4.0.0/hw/vfio/pci.c
+--- qemu-4.0.0/hw/vfio/pci.c	2019-04-24 04:14:46.000000000 +1000
++++ /home/jhl/proj/fibo/patched_qemu/work/qemu-4.0.0/hw/vfio/pci.c	2019-10-15 18:44:53.559889647 +1100
+@@ -2230,6 +2230,9 @@
+ 
+     trace_vfio_pci_hot_reset(vdev->vbasedev.name, single ? "one" : "multi");
+ 
++    error_printf("vfio: eliding vfio_pci_hot_reset\n");
++    return 0;
++
+     if (!single) {
+         vfio_pci_pre_reset(vdev);
+     }
+@@ -2887,6 +2890,7 @@
+         vfio_put_group(group);
+         goto error;
+     }
++    error_printf("vfio_get_device prep\n");
+ 
+     ret = vfio_get_device(group, vdev->vbasedev.name, &vdev->vbasedev, errp);
+     if (ret) {
+@@ -2894,11 +2898,14 @@
+         goto error;
+     }
+ 
++    error_printf("vfio_get_device ok\n");
++
+     vfio_populate_device(vdev, &err);
+     if (err) {
+         error_propagate(errp, err);
+         goto error;
+     }
++    error_printf("vfio_populate_device ok\n");
+ 
+     /* Get a copy of config space */
+     ret = pread(vdev->vbasedev.fd, vdev->pdev.config,
+@@ -2909,6 +2916,7 @@
+         error_setg_errno(errp, -ret, "failed to read device config space");
+         goto error;
+     }
++    error_printf("vfio get config ok\n");
+ 
+     /* vfio emulates a lot for us, but some bits need extra love */
+     vdev->emulated_config_bits = g_malloc0(vdev->config_size);
+@@ -2986,21 +2994,26 @@
+     memset(&vdev->pdev.config[PCI_ROM_ADDRESS], 0, 4);
+ 
+     vfio_pci_size_rom(vdev);
++    error_printf("vfio_pci_size_rom ok\n");
+ 
+     vfio_bars_prepare(vdev);
++    error_printf("vfio_bars_prepare ok\n");
+ 
+     vfio_msix_early_setup(vdev, &err);
+     if (err) {
+         error_propagate(errp, err);
+         goto error;
+     }
++    error_printf("vfio_msix_early ok\n");
+ 
+     vfio_bars_register(vdev);
++    error_printf("vfio_bars_register ok\n");
+ 
+     ret = vfio_add_capabilities(vdev, errp);
+     if (ret) {
+         goto out_teardown;
+     }
++    error_printf("vfio_add_capabilities ok\n");
+ 
+     if (vdev->vga) {
+         vfio_vga_quirk_setup(vdev);
+@@ -3008,6 +3021,7 @@
+ 
+     for (i = 0; i < PCI_ROM_SLOT; i++) {
+         vfio_bar_quirk_setup(vdev, i);
++    error_printf("vfio_bar_quirk_setup %d ok\n", i);
+     }
+ 
+     if (!vdev->igd_opregion &&
+@@ -3052,7 +3066,9 @@
+         vdev->intx.mmap_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                                   vfio_intx_mmap_enable, vdev);
+         pci_device_set_intx_routing_notifier(&vdev->pdev, vfio_intx_update);
++	error_printf("doing vfio_intx_enable\n");
+         ret = vfio_intx_enable(vdev, errp);
++	error_printf("doing vfio_intx_enable %d\n", ret);
+         if (ret) {
+             goto out_teardown;
+         }
+@@ -3083,6 +3099,7 @@
+     vfio_register_req_notifier(vdev);
+     vfio_setup_resetfn_quirk(vdev);
+ 
++	error_printf("vfio up\n");
+     return;
+ 
+ out_teardown:
